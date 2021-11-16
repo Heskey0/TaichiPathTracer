@@ -2,22 +2,15 @@ import taichi as ti
 import numpy as np
 
 ti.init(arch=ti.cuda)
-res = (1000, 1000)  # resolution
-# field
-color_buffer = ti.Vector.field(3, dtype=ti.f32, shape=res)  # 屏幕像素缓冲 [800, 800] 元素为(r, g, b)
-count_var = ti.field(ti.i32, shape=(1,))
+resolution = (940, 940)
 
-max_ray_depth = 10
 eps = 0.0001  # 浮点数精度
 inf = 1e10
-fov = 0.8
-
-camera_pos = ti.Vector([0.0, 0.6, 3.0])
 
 mat_none = 0
 mat_lambertian = 1
-mat_specular = 2
-mat_glass = 3
+mat_specular = 2    # 镜面
+mat_glass = 3       # 玻璃
 mat_light = 4
 mat_microfacet = 5
 mat_glossy = 6
@@ -38,17 +31,12 @@ light_max_pos = ti.Vector([
     light_y_pos,
     light_z_min_pos + light_z_range
 ])
-# light_color = ti.Vector(list(np.array([0.9, 0.85, 0.7])))  # 光源的颜色
-light_color = ti.Vector(list(np.array([1, 1, 1])))  # 光源的颜色
+light_color = ti.Vector([1, 1, 1])
 light_normal = ti.Vector([0.0, -1.0, 0.0])  # 光源方向向下
 
-# No absorbtion     没有吸收光谱，Albedo为1，对单位半球积分
-lambertian_brdf = 1.0 / np.pi  # f(lambert) = k*c / π       # k = 1,  c = hit_color*light_color
 
-# diamond
-# 玻璃材质的折射率 refract index
-# 2.4 : 钻石的折射率
-refr_idx = 2.4
+# 1.7700 : 红宝石的折射率
+refract_index = 1.7700
 
 # right sphere
 sp1_center = ti.Vector([0.5, 1.18, 1.40])
@@ -56,9 +44,16 @@ sp1_radius = 0.18
 # left sphere
 sp2_center = ti.Vector([-0.35, 0.65, 1.70])
 sp2_radius = 0.15
-# middle sphere
-sp3_center = ti.Vector([-0.05, 0.35, 1])
+# middle sphere(microfacet)
+sp3_center = ti.Vector([-0.10, 0.35, 1])
 sp3_radius = 0.35
+sp3_microfacet_roughness = 0.5
+# sp3_idx = 1.55  # 石英晶体折射率
+sp3_idx = 2.4  # 钻石折射率
+# right front sphere(microfacet)
+sp4_center = ti.Vector([-0.05, 1, 1])
+sp4_radius = 0.3
+sp4_microfacet_roughness = 1
 
 
 # 构造变换矩阵，用于box
@@ -95,6 +90,86 @@ box2_max = ti.Vector([0.4, 0.5, 0.4])
 box2_rotate_rad = np.pi / 4
 box2_m_inv, box2_m_inv_t = make_box_transform_matrices(box2_rotate_rad, ti.Vector([-0.75, 0, 1.70]))  # box的transform的 逆矩阵, 逆转置矩阵
 
+
+'''
+lambertian brdf
+'''
+# No absorbtion     没有吸收光谱，Albedo为1，对单位半球积分
+lambertian_brdf = 1.0 / np.pi  # f(lambert) = k*c / π       # k = 1,  c = hit_color*light_color
+
+
+'''
+microfacet brdf
+'''
+# compute reflectance
+# 计算反射比
+@ti.func
+def schlick(cos, eta):  # 入射角cosine, 折射率refractive index
+    r0 = (1.0 - eta) / (1.0 + eta)
+    r0 = r0 * r0  # 反射比 reflectance
+    return r0 + (1 - r0) * ((1.0 - cos) ** 5)
+
+
+# normal distribution function
+@ti.func
+def ggx(alpha, i_dir, o_dir, n_dir):  # roughness, incident, exit, normal
+    m_dir = (i_dir + o_dir).normalized()
+    cos_theta_square = m_dir.dot(n_dir)
+    tan_theta_square = (1-cos_theta_square) / cos_theta_square
+    root = alpha / cos_theta_square * (alpha*alpha + tan_theta_square)
+    return root*root / np.pi
+
+
+@ti.func
+def ggx2(alpha, i_dir, o_dir, n_dir):
+    m_dir = (i_dir + o_dir).normalized()
+    NoM = n_dir.dot(m_dir)
+    d = NoM*NoM * (alpha*alpha-1) + 1
+    return alpha*alpha / np.pi*d*d
+
+
+@ti.func
+def smithG1(alpha, v_dir, n_dir):
+    out = 0.0
+    # compute tan_theta(v / n)
+    cos_theta_square = v_dir.dot(n_dir) ** 2
+    tan_theta_square = (1-cos_theta_square) / cos_theta_square
+    tan_theta = ti.sqrt(tan_theta_square)
+    if tan_theta == 0:
+        out = 1
+    else:
+        root = alpha * tan_theta
+        out = 2 / (1 + ti.sqrt(1.0 + root * root))
+
+    return out
+
+
+@ti.func
+# shadowing-masking
+def smith(alpha, i_dir, o_dir, n_dir):  # roughness, incident, exit, normal
+    # m_dir = (i_dir + o_dir).normalized()
+    # shadowing * masking
+    return smithG1(alpha, i_dir, n_dir) * smithG1(alpha, o_dir, n_dir)
+
+
+@ti.func
+def compute_microfacet_brdf(alpha, idx, i_dir, o_dir, n_dir):
+    micro_cos = o_dir.dot((i_dir + o_dir).normalized())
+    # numerator and denominator
+    D = ggx2(alpha, i_dir, o_dir, n_dir)
+    G = smith(alpha, i_dir, o_dir, n_dir)
+    F = schlick(micro_cos, idx)
+    # print(D, G, F)
+
+    numerator = D * G * F
+    denominator = 4 * o_dir.dot(n_dir) * i_dir.dot(n_dir)
+    cook_torrance = numerator / ti.abs(denominator)
+    return cook_torrance
+
+
+'''
+basic functions
+'''
 # 反射
 @ti.func
 def reflect(d, n):
@@ -165,6 +240,7 @@ def intersect_plane(pos, d, pt_on_plane, norm):  # position, ray_dir, offset, no
     return dist, hit_pos  # 光源到命中点的距离, 命中点坐标
 
 
+# 参考清华大学图形学课程中的基于slab的求交算法：Liang_Barsky算法
 # aabb包围体 call by intersect_box and intersect_light
 @ti.func
 def intersect_aabb(box_min, box_max, o, d):  # box_min, box_max, pos(box空间), ray_dir(box空间)
@@ -254,7 +330,7 @@ def intersect_scene(pos, ray_dir):
     if 0 < cur_dist < closest:  # 深度测试
         closest = cur_dist
         normal = (hit_pos - sp3_center).normalized()
-        c, mat = ti.Vector([1.0, 1.0, 1.0]), mat_lambertian
+        c, mat = ti.Vector([102.0/255.0, 153.0/255.0, 255.0/255.0]), mat_microfacet
 
     # left Sphere
     cur_dist, hit_pos = intersect_sphere(pos, ray_dir, sp2_center, sp2_radius)
@@ -345,19 +421,30 @@ def dot_or_zero(n, l):
     return max(0.0, n.dot(l))
 
 
+
+
+
+
+
+
+
+
+
 # TODO:begin
 # '''
+# sampling functions
+
 # multiple importance sampling
 @ti.func
-def mis_power_heuristic(pf, pg):
+def compute_heuristic(pf, pg):
     # Assume 1 sample for each distribution
     f = pf ** 2
     g = pg ** 2
     return f / (f + g)
 
-# '''
 
-# 计算区域光 pdf
+# 已知sample dir
+# area light pdf
 @ti.func
 def compute_area_light_pdf(pos, ray_dir):
     hit_l, t = intersect_light(pos, ray_dir, inf)
@@ -370,13 +457,16 @@ def compute_area_light_pdf(pos, ray_dir):
             pdf = dist_sqr / (light_area * l_cos)
     return pdf
 
-# 如果已知sample dir
+
+# 已知sample dir
 # cosine weighted sampling
 @ti.func
-def compute_brdf_pdf(normal, sample_dir):
+def compute_cosineWeighted_pdf(normal, sample_dir):
     return dot_or_zero(normal, sample_dir) / np.pi  # p(theta, phi) = cos(theta) * sin(theta) / pi
 
 
+# 未知sample dir
+# sample light
 @ti.func
 def sample_area_light(hit_pos, pos_normal):
     # sampling inside the light area
@@ -386,15 +476,15 @@ def sample_area_light(hit_pos, pos_normal):
     return (on_light_pos - hit_pos).normalized()
 
 
-# cosine hemisphere sampling    进行一个点的半球采样
-# uniformly sample on a disk
+# 未知sample dir
+# Cosine-Weighted Sampling
 @ti.func
-def sample_brdf(normal):
+def cosine_weighted_sampling(normal):
     r, phi = 0.0, 0.0  # 圆上的 (r, theta) 在半球里实际上是 (sin(theta), phi) ，将其变换到 (theta, phi)
-    sx = ti.random() * 2.0 - 1.0  # -1 ~ 1
-    sy = ti.random() * 2.0 - 1.0  # -1 ~ 1
+    sx = ti.random() * 2.0 - 1.0  # -1 ~ 1 random
+    sy = ti.random() * 2.0 - 1.0  # -1 ~ 1 random
     # 1.concentric sample
-    # not polar mapping
+    # sample on a unit disk
     if sx != 0 or sy != 0:
         if abs(sx) > abs(sy):
             r = sx
@@ -402,80 +492,58 @@ def sample_brdf(normal):
         else:
             r = sy
             phi = np.pi / 4 * (2 - sx / sy)
-    # we can use Jacobian |J| to complete the Polar->Cartesian coordinate transformation
-    # 雅可比行列式意义:代表经过变换后的空间与原空间的面积（2维）、体积（3维）等等的比例，也有人称缩放因子。
-    # p(r, phi) = r/pi
-    # The vertical projection gives sin(theta) = r
-    # so we need to complete the p(r, phi)=p(sin(theta), phi)->p(theta, phi) transformation
-    # then we need the determinant of the Jacobian = cos(theta)
-    # p(theta, phi) = |J|*p(r, theta) = cos(theta)*p(r, theta) = cos(theta)*sin(theta)/pi
 
-    # 2.apply Malley's method to project disk to hemisphere
-    # Cosine-Weighted Hemisphere Sampling
-    # pbrt 13.6.2
-    ## 由normal为中心轴,u和v为水平轴建立笛卡尔坐标系
+    # 2.apply Malley's method
+    # project disk to hemisphere
+
+    # 由normal为中心轴,u和v为水平轴建立笛卡尔坐标系
     # 不需要关心normal和vector.up的关系，vector.up的引入是为了辅助建立起坐标系(u,v,normal)
     u = ti.Vector([1.0, 0.0, 0.0])
     if abs(normal[1]) < 1 - eps:
         u = normal.cross(ti.Vector([0.0, 1.0, 0.0]))  # normal x vector.up = sin(eta)
     v = normal.cross(u)  # normal x u = |u| = sin(eta)
+
     # theta : vector.up 与 normal 的夹角
     # u,v垂直, 长度均为sin(phi), 均在微平面上
 
-    # costt, sintt = ti.cos(phi), ti.sin(phi)
-    # xy = (u * costt + v * sintt) * r    # u*x + v*y
-    # 表示一个点处的法线，只需要两个值(x,y)，然后计算出z=sqrt(1-x^2-y^2)
     xy = r * ti.cos(phi) * u + r * ti.sin(phi) * v  # 采样时的x,y,normal坐标系转换到u,v,normal坐标系(采样点随之旋转并变为sin(eta)倍)
-    zlen = ti.sqrt(max(0.0, 1.0 - xy.dot(xy)))  # xi + norm*sqrt(1 - xi**2)
+    zlen = ti.sqrt(max(0.0, 1.0 - xy.dot(xy)))  # zlen:采样线沿normal的长度
 
-    # xy = r*ti.cos(phi)*sin()
     return xy + zlen * normal  # sample dir
 
 
-# '''
+# 两种pdf相乘, 结果为对光采样
+# sample direct light
 @ti.func
-def sample_direct_light(hit_pos, hit_normal, hit_color):
-    direct_li = ti.Vector([0.0, 0.0, 0.0])  # 直接光
-    fl = lambertian_brdf * hit_color * light_color  # f(lambert), lambert的brdf与入射角度无关
+def sample_light_and_cosineWeighted(hit_pos, hit_normal):
+    cosine_by_pdf = ti.Vector([0.0, 0.0, 0.0])
 
-    light_pdf, brdf_pdf = 0.0, 0.0
+    light_pdf, cosineWeighted_pdf = 0.0, 0.0
 
-    # sample area light
-    to_light_dir = sample_area_light(hit_pos, hit_normal)
-    if to_light_dir.dot(hit_normal) > 0:
-        light_pdf = compute_area_light_pdf(hit_pos, to_light_dir)
-        brdf_pdf = compute_brdf_pdf(hit_normal, to_light_dir)
-        if light_pdf > 0 and brdf_pdf > 0:
-            l_visible = visible_to_light(hit_pos, to_light_dir)
+    # sample area light => dir, light_pdf; then dir => lambertian_pdf; then mis
+    light_dir = sample_area_light(hit_pos, hit_normal)
+    if light_dir.dot(hit_normal) > 0:
+        light_pdf = compute_area_light_pdf(hit_pos, light_dir)
+        cosineWeighted_pdf = compute_cosineWeighted_pdf(hit_normal, light_dir)
+        if light_pdf > 0 and cosineWeighted_pdf > 0:
+            l_visible = visible_to_light(hit_pos, light_dir)
             if l_visible:
-                w = mis_power_heuristic(light_pdf, brdf_pdf)
-                nl = dot_or_zero(to_light_dir, hit_normal)
-                direct_li += fl * w * nl / light_pdf
+                heuristic = compute_heuristic(light_pdf, cosineWeighted_pdf)
+                DoN = dot_or_zero(light_dir, hit_normal)
+                cosine_by_pdf += heuristic * DoN / light_pdf
 
-    # sample brdf
-    brdf_dir = sample_brdf(hit_normal)
-    brdf_pdf = compute_brdf_pdf(hit_normal, brdf_dir)
-    if brdf_pdf > 0:
-        light_pdf = compute_area_light_pdf(hit_pos, brdf_dir)
-        if light_pdf > 0:
-            l_visible = visible_to_light(hit_pos, brdf_dir)
-            if l_visible:
-                w = mis_power_heuristic(brdf_pdf, light_pdf)
-                nl = dot_or_zero(brdf_dir, hit_normal)
-                direct_li += fl * w * nl / brdf_pdf
+    # sample cosine weighted => dir, lambertian_pdf; then dir => light_pdf; then mis
+    cosineWeighted_dir = cosine_weighted_sampling(hit_normal)
+    cosineWeighted_pdf = compute_cosineWeighted_pdf(hit_normal, cosineWeighted_dir)
+    light_pdf = compute_area_light_pdf(hit_pos, cosineWeighted_dir)
+    if visible_to_light(hit_pos, cosineWeighted_dir):
+        heuristic = compute_heuristic(cosineWeighted_pdf, light_pdf)
+        DoN = dot_or_zero(cosineWeighted_dir, hit_normal)
+        cosine_by_pdf += heuristic * DoN / cosineWeighted_pdf
 
-    return direct_li
+    # direct_li = mis_weight * cosine / pdf
+    return cosine_by_pdf
 
-
-# '''
-
-# 计算反射发生的概率, brdf的G项
-# 菲涅尔反射能量公式的Schlick近似公式
-@ti.func
-def schlick(cos, eta):  # 入射角cosine, 折射率refractive index
-    r0 = (1.0 - eta) / (1.0 + eta)
-    r0 = r0 * r0  # 反射比 reflectance
-    return r0 + (1 - r0) * ((1.0 - cos) ** 5)  # Fresnel brdf (反射的概率)
 
 
 @ti.func
@@ -483,90 +551,89 @@ def sample_ray_dir(indir, normal, hit_pos, mat):
     u = ti.Vector([0.0, 0.0, 0.0])  # 用于下一次追踪的ray_dir
     pdf = 1.0
     if mat == mat_lambertian:
-        u = sample_brdf(normal)  # sample brdf
-        pdf = max(eps, compute_brdf_pdf(normal, u))  # 计算在该方向采样射线的pdf
+        u = cosine_weighted_sampling(normal)  # sample brdf : return ray_dir
+        pdf = max(eps, compute_cosineWeighted_pdf(normal, u))  # 计算在该方向采样射线的pdf
     elif mat == mat_glossy:
         pass
     elif mat == mat_microfacet:
-        pass    # TODO:
+        # TODO:对cosine项采样
+        u = cosine_weighted_sampling(normal)  # sample brdf : return ray_dir
+        pdf = max(eps, compute_cosineWeighted_pdf(normal, u))  # 计算在该方向采样射线的pdf
+
     elif mat == mat_specular:  # 反射, pdf = 1
         u = reflect(indir, normal)
     elif mat == mat_glass:  # 折射, 反射, pdf = 1
         cos = indir.dot(normal)  # indir和normal的夹角 (indir和normal为单位向量)
-        ni_over_nt = refr_idx  # ni / nt = 折射率
+        ni_over_nt = refract_index  # ni / nt = 折射率
         outn = normal
         if cos > 0.0:
             outn = -normal
-            cos = refr_idx * cos  # 出射角度
+            cos = refract_index * cos  # 出射角度
         else:
-            ni_over_nt = 1.0 / refr_idx
+            ni_over_nt = 1.0 / refract_index
             cos = -cos  # indir转180°
 
-        refl_prob = schlick(cos, refr_idx)  # Fresnel brdf (反射的概率)
-        if ti.random() < refl_prob:  # 反射
+        refl_prob = schlick(cos, refract_index)  # Fresnel reflectance
+        if ti.random() < refl_prob:  # 反射的能量
             u = reflect(indir, normal)
-        else:  # 折射
+        else:  # 折射的能量
             u = refract(indir, outn, ni_over_nt)
     return u.normalized(), pdf  # 用于下一次追踪的ray_dir, pdf
 
 
-# 层数
-stratify_res = 5
-inv_stratify = 1.0 / stratify_res
+pixels = ti.Vector.field(3, dtype=ti.f32, shape=resolution)
+
+camera_pos = ti.Vector([0.0, 0.6, 3.0])
+fov = 0.8
+
+max_bounce = 10
 
 
 @ti.kernel
 def render():
-    print('hello')
-    for u, v in color_buffer:  # 遍历像素
-        aspect_ratio = res[0] / res[1]  # 屏幕高宽比
+    for u, v in pixels:  # 遍历像素
         pos = camera_pos
-        cur_iter = count_var[0]  # 每render一次, 值+1, 到25时变为0
-        str_x, str_y = (cur_iter / stratify_res), (cur_iter % stratify_res)
         ray_dir = ti.Vector([
-            (2 * fov * (u + (str_x + ti.random()) * inv_stratify) / res[1] - fov * aspect_ratio - 1e-5),
-            (2 * fov * (v + (str_y + ti.random()) * inv_stratify) / res[1] - fov - 1e-5),
-            -1.0,
-        ])
-        # ray_dir = ti.Vector([0, 0, 1])
-        ray_dir = ray_dir.normalized()
+            (2 * fov * (u + ti.random()) / resolution[1] - fov * resolution[0] / resolution[1] - 1e-5),
+            2 * fov * (v + ti.random()) / resolution[1] - fov - 1e-5, -1.0
+        ]).normalized()
 
-        acc_color = ti.Vector([0.0, 0.0, 0.0])  # 累加到color_buffer
+        final_throughput = ti.Vector([0.0, 0.0, 0.0])  # 累加到pixels
         throughput = ti.Vector([1.0, 1.0, 1.0])  # Lighting : (r, g, b)
 
         # 追踪开始
-        depth = 0
-        while depth < max_ray_depth:  # bounce的最大次数
+        bounce = 0
+        while bounce < max_bounce:  # bounce的最大次数
+            bounce += 1
             # closest:光源到物体的距离
             closest, hit_normal, hit_color, mat = intersect_scene(pos, ray_dir)  # 光发出后碰到场景
 
-            # 1.命中灯光或无材质, 则中断追踪
-            if mat == mat_none:  ## 没有材质
-                acc_color += throughput * 0
+            # 0.命中灯光或无材质, 则中断追踪
+            if mat == mat_none:
+                final_throughput += throughput * 0
                 break
-            if mat == mat_light:  ## 是否击中了灯光
-                acc_color += throughput * light_color
+            if mat == mat_light:
+                final_throughput += throughput * light_color
                 break
 
             hit_pos = pos + closest * ray_dir
+            ray_dir_i = -ray_dir
 
-            # 0.计算采样后的ray_dir, pdf
-            depth += 1
+            # 1.计算采样后的ray_dir, pdf
+
+            # 2.lambertian : sample direct light [ mis(sample area light, sample brdf)=> Li ]
+            if mat == mat_lambertian:  # lambertian模型
+                final_throughput += light_color * throughput * lambertian_brdf * hit_color * sample_light_and_cosineWeighted(hit_pos, hit_normal)
+                # Sample Direct Light Only
+                # throughput *= sample_light_and_cosineWeighted(hit_pos, hit_normal, hit_color)
+
+            # 2.lambertian : sample cosine-Weighted
             ray_dir, pdf = sample_ray_dir(ray_dir, hit_normal, hit_pos, mat)  # 由反射更新ray_dir
             pos = hit_pos + eps * ray_dir
-
-            # 2.命中漫反射物体:sample the light
-            if mat == mat_lambertian:  ## lambertian模型
-                acc_color += throughput * sample_direct_light(hit_pos, hit_normal, hit_color)
-                pass
-            # 2.命中漫反射物体:rendering equation
-            if mat == mat_lambertian:  ## lambertian模型
+            if mat == mat_lambertian:  # lambertian
                 # f(lambert) * max(0.0, cos(n,l)) / pdf
-                # throughput : Li Lo
-                # lambertian_brdf : albedo / pi
-                # pdf : cosine weighted sampling
+                # throughput : Li or Lo
                 throughput *= (lambertian_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
-                # throughput *= hit_color
 
             # 3.specular全反射
             if mat == mat_specular:
@@ -575,39 +642,53 @@ def render():
             if mat == mat_glass:
                 throughput *= hit_color
 
-            # 5.glossy
-            if mat == mat_glossy:
+            # 5.microfacet
+            if mat == mat_microfacet:
+                # compute_microfacet_brdf params:(alpha, idx, i_dir, o_dir, n_dir)
+                cook_torrance_brdf = compute_microfacet_brdf(sp3_microfacet_roughness, sp3_idx, ray_dir_i, ray_dir, hit_normal)
+                # print(lambertian_brdf, cook_torrance_brdf)
+
+                microfacet_brdf = lambertian_brdf + cook_torrance_brdf  # TODO:BUG 黑屏
+
+                throughput *= (microfacet_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
+
+            # 6.glossy
+            if mat == mat_glossy:  #
                 throughput *= (lambertian_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
 
-            # 6.microfacet
-            if mat == mat_microfacet:
-                throughput *= (lambertian_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
 
         # 追踪结束
 
-        color_buffer[u, v] += acc_color
-    count_var[0] = (count_var[0] + 1) % (stratify_res * stratify_res)
+        pixels[u, v] += final_throughput
 
 
-gui = ti.GUI('Heskey0 Box Renderer', res)
+gui = ti.GUI('Path Tracing', resolution)
 i = 0
 
 while gui.running:
     # if gui.get_event(ti.GUI.PRESS):
-    #     if gui.event.key == 'r':
+    #     if gui.event.key == 'w':
     #         gui.clear()
     #         i = 0
     #         interval = 10
-    #         # color_buffer = ti.Vector.field(3, dtype=ti.f32, shape=res)  # 屏幕像素缓冲 [800, 800] 元素为(r, g, b)
+    #         # pixels = ti.Vector.field(3, dtype=ti.f32, shape=resolution)  # 屏幕像素缓冲 [800, 800] 元素为(r, g, b)
     #         count_var = ti.field(ti.i32, shape=(1,))
     #         box1_rotate_rad += np.pi/8
 
+    if gui.get_event(ti.GUI.PRESS):
+        if gui.event.key == 'w':
+            img = pixels.to_numpy()
+            img = np.sqrt(img / img.mean() * 0.24)
+            fname = f'cornell_box.png'
+            ti.imwrite(img, fname)
+            print("图片已存储")
 
     render()
     interval = 10  # render()10次, 绘1次图
     if i % interval == 0 and i > 0:
-        img = color_buffer.to_numpy()  # [800, 800, 3]
-        img = np.sqrt(img / img.mean() * 0.24)  # 像素点颜色值 / 整体亮度 * 0.24
+        img = pixels.to_numpy()
+        img = np.sqrt(img / img.mean() * 0.24)
         gui.set_image(img)
+
         gui.show()
     i += 1
