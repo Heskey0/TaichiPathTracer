@@ -648,7 +648,8 @@ def render():
                 cook_torrance_brdf = compute_microfacet_brdf(sp3_microfacet_roughness, sp3_idx, ray_dir_i, ray_dir, hit_normal)
                 # print(lambertian_brdf, cook_torrance_brdf)
 
-                microfacet_brdf = lambertian_brdf + cook_torrance_brdf  # TODO:BUG 黑屏
+                microfacet_brdf = lambertian_brdf  # TODO:正常
+                # microfacet_brdf = lambertian_brdf + cook_torrance_brdf  # TODO:BUG 黑屏
 
                 throughput *= (microfacet_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
 
