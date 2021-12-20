@@ -1,3 +1,13 @@
+Environment:
+
+```
+[Taichi] version 0.8.4, llvm 10.0.0, commit 895881b5, win, python 3.7.10
+[Taichi] Starting on arch=cuda
+```
+
+Reference:
+《Physically based rendering:from theory to implementation》
+
 # path tracer based on 《PBRT》
 
 
