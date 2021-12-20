@@ -581,6 +581,29 @@ def sample_ray_dir(indir, normal, hit_pos, mat):
     return u.normalized(), pdf  # 用于下一次追踪的ray_dir, pdf
 
 
+# Base为质数
+@ti.func
+def RadicalInverse(Base, i):
+    Digit = 0.0
+    Radical = 0.0
+    Inverse = 0.0
+    Digit = Radical = 1.0 / Base
+    while i > 0:
+        # i余Base求出i在"Base"进制下的最低位的数
+        # 乘以Digit将这个数镜像到小数点右边
+        Inverse += Digit * (i % Base)
+        Digit *= Radical
+        # i除以Base即可求右一位的数
+        i /= Base
+        return Inverse
+
+
+# Dimension为质数
+@ti.func
+def Halton(Dimension, Index):
+    return RadicalInverse(Dimension, Index)
+
+
 pixels = ti.Vector.field(3, dtype=ti.f32, shape=resolution)
 
 camera_pos = ti.Vector([0.0, 0.6, 3.0])
@@ -593,6 +616,11 @@ max_bounce = 10
 def render():
     for u, v in pixels:  # 遍历像素
         pos = camera_pos
+        # ray_dir = ti.Vector([
+        #     (2 * fov * (u + ti.random()) / resolution[1] - fov * resolution[0] / resolution[1] - 1e-5),
+        #     2 * fov * (v + ti.random()) / resolution[1] - fov - 1e-5, -1.0
+        # ]).normalized()
+
         ray_dir = ti.Vector([
             (2 * fov * (u + ti.random()) / resolution[1] - fov * resolution[0] / resolution[1] - 1e-5),
             2 * fov * (v + ti.random()) / resolution[1] - fov - 1e-5, -1.0
@@ -633,6 +661,7 @@ def render():
             if mat == mat_lambertian:  # lambertian
                 # f(lambert) * max(0.0, cos(n,l)) / pdf
                 # throughput : Li or Lo
+                # the light transport equation
                 throughput *= (lambertian_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
 
             # 3.specular全反射
@@ -654,7 +683,7 @@ def render():
                 throughput *= (microfacet_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
 
             # 6.glossy
-            if mat == mat_glossy:  #
+            if mat == mat_glossy:  # TODO:
                 throughput *= (lambertian_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
 
 
