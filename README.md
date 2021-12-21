@@ -1,3 +1,9 @@
+implementation:
+1. Microfacet material
+2. Multiple importance sampling
+3. Malley's Method
+4. reflection and refraction
+
 Environment:
 
 ```
