@@ -47,7 +47,7 @@ sp2_radius = 0.15
 # middle sphere(microfacet)
 sp3_center = ti.Vector([-0.10, 0.35, 0.6])
 sp3_radius = 0.35
-sp3_microfacet_roughness = 0.5
+sp3_microfacet_roughness = 0.1
 # sp3_idx = 1.55  # 石英晶体折射率
 sp3_idx = 2.4  # 钻石折射率
 # right front sphere(microfacet)
@@ -189,7 +189,8 @@ def compute_microfacet_brdf(alpha, idx, i_dir, o_dir, n_dir):
     F = schlick(micro_cos, idx)
 
     # print(D * V * F)
-    return D * V * F * 10
+    out = D * V * F
+    return out
 
 
 '''
@@ -355,7 +356,8 @@ def intersect_scene(pos, ray_dir):
     if 0 < cur_dist < closest:  # 深度测试
         closest = cur_dist
         normal = (hit_pos - sp3_center).normalized()
-        c, mat = ti.Vector([102.0/255.0, 153.0/255.0, 255.0/255.0]), mat_microfacet
+        # c, mat = ti.Vector([102.0/255.0, 153.0/255.0, 255.0/255.0]), mat_microfacet
+        c, mat = ti.Vector([68.0/255.0, 175.0/255.0, 238.0/255.0]), mat_microfacet
 
     # left Sphere
     cur_dist, hit_pos = intersect_sphere(pos, ray_dir, sp2_center, sp2_radius)
@@ -702,8 +704,8 @@ def render():
                 cook_torrance_brdf = compute_microfacet_brdf(sp3_microfacet_roughness, sp3_idx, ray_dir_i, ray_dir, hit_normal)
                 # print(lambertian_brdf, cook_torrance_brdf)
 
-                # microfacet_brdf = lambertian_brdf  # TODO:正常
-                microfacet_brdf = cook_torrance_brdf  # TODO:BUG 黑屏
+                # microfacet_brdf = lambertian_brdf
+                microfacet_brdf = 0.7 * lambertian_brdf + cook_torrance_brdf
 
                 throughput *= (microfacet_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
 
