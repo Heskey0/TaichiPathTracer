@@ -45,7 +45,7 @@ sp1_radius = 0.18
 sp2_center = ti.Vector([-0.35, 0.65, 1.70])
 sp2_radius = 0.15
 # middle sphere(microfacet)
-sp3_center = ti.Vector([-0.10, 0.35, 1])
+sp3_center = ti.Vector([-0.10, 0.35, 0.6])
 sp3_radius = 0.35
 sp3_microfacet_roughness = 0.5
 # sp3_idx = 1.55  # 石英晶体折射率
@@ -153,18 +153,43 @@ def smith(alpha, i_dir, o_dir, n_dir):  # roughness, incident, exit, normal
 
 
 @ti.func
+def GGX(alpha, NoH, h):
+    a = NoH * alpha
+    k = alpha / (1 - NoH*NoH + a*a)
+    d = k*k * (1/np.pi)
+    return d
+
+@ti.func
+def SmithGGX(alpha, NoV, NoL):
+    a2 = alpha*alpha
+    GGXV = NoL * ti.sqrt((NoV - a2*NoV)*NoV + a2)
+    GGXL = NoL * ti.sqrt((NoL - a2*NoL)*NoL + a2)
+    return 0.5 / (GGXV + GGXL)
+
+@ti.func
 def compute_microfacet_brdf(alpha, idx, i_dir, o_dir, n_dir):
     micro_cos = o_dir.dot((i_dir + o_dir).normalized())
-    # numerator and denominator
-    D = ggx2(alpha, i_dir, o_dir, n_dir)
-    G = smith(alpha, i_dir, o_dir, n_dir)
-    F = schlick(micro_cos, idx)
-    # print(D, G, F)
+    # # numerator and denominator
+    # D = ggx2(alpha, i_dir, o_dir, n_dir)
+    # G = smith(alpha, i_dir, o_dir, n_dir)
+    # F = schlick(micro_cos, idx)
+    # # print(D, G, F)
+    #
+    # numerator = D * G * F
+    # denominator = 4 * o_dir.dot(n_dir) * i_dir.dot(n_dir)
+    # cook_torrance = numerator / ti.abs(denominator)
+    # return cook_torrance
 
-    numerator = D * G * F
-    denominator = 4 * o_dir.dot(n_dir) * i_dir.dot(n_dir)
-    cook_torrance = numerator / ti.abs(denominator)
-    return cook_torrance
+    h = (i_dir + o_dir).normalized()
+    NoH = n_dir.dot(h)
+    NoV = n_dir.dot(i_dir)
+    NoL = n_dir.dot(o_dir)
+    D = GGX(alpha, NoH, h)
+    V = SmithGGX(alpha, NoV, NoL)
+    F = schlick(micro_cos, idx)
+
+    # print(D * V * F)
+    return D * V * F * 10
 
 
 '''
@@ -677,8 +702,8 @@ def render():
                 cook_torrance_brdf = compute_microfacet_brdf(sp3_microfacet_roughness, sp3_idx, ray_dir_i, ray_dir, hit_normal)
                 # print(lambertian_brdf, cook_torrance_brdf)
 
-                microfacet_brdf = lambertian_brdf  # TODO:正常
-                # microfacet_brdf = lambertian_brdf + cook_torrance_brdf  # TODO:BUG 黑屏
+                # microfacet_brdf = lambertian_brdf  # TODO:正常
+                microfacet_brdf = cook_torrance_brdf  # TODO:BUG 黑屏
 
                 throughput *= (microfacet_brdf * hit_color) * dot_or_zero(hit_normal, ray_dir) / pdf
 
