@@ -4,6 +4,11 @@ implementation:
 3. Malley's Method
 4. reflection and refraction
 
+Taichi Course Season 1 final project (homework).
+
+![taichi](https://user-images.githubusercontent.com/68142480/152927528-9447d055-9498-450e-9dd9-5d0cfe0ad0e5.jpg)
+
+
 Environment:
 
 ```
